@@ -29,6 +29,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    Enum,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -115,64 +116,11 @@ class IncidentStatusEnum(str, PyEnum):
     resolved = "resolved"
 
 
-class SupportTypeEnum(str, enum.Enum):
-    peer = "peer"
-    professional = "professional"
-    self_help = "self_help"
-    any = "any"
-
-
-class SessionStatusEnum(str, enum.Enum):
-    active = "active"
-    closed = "closed"
-    flagged = "flagged"
-
-
-class SenderRoleEnum(str, enum.Enum):
-    student = "student"
-    peer_counselor = "peer_counselor"
-    professional_counselor = "professional_counselor"
-    system = "system"
-
-
-class ReportStatusEnum(str, enum.Enum):
-    pending = "pending"
-    reviewed = "reviewed"
-    dismissed = "dismissed"
-    actioned = "actioned"
-
-
-class ContentTypeEnum(str, enum.Enum):
-    article = "article"
-    video = "video"
-    exercise = "exercise"
-
-
-class AppointmentStatusEnum(str, enum.Enum):
-    requested = "requested"
-    confirmed = "confirmed"
-    cancelled = "cancelled"
-    completed = "completed"
-    no_show = "no_show"
-
-
-class SeverityEnum(str, enum.Enum):
-    low = "low"
-    medium = "medium"
-    high = "high"
-    critical = "critical"
-
-
-class IncidentStatusEnum(str, enum.Enum):
-    open = "open"
-    investigating = "investigating"
-    resolved = "resolved"
-    closed = "closed"
-
-
-class RetentionPolicyEnum(str, enum.Enum):
-    standard = "standard"      # purge 24h after session close
-    flagged = "flagged"         # retain 90 days, encrypted, dual-admin access
+class RetentionPolicyEnum(str, PyEnum):
+    """Message retention policy."""
+    standard = "standard"
+    discard_on_close = "discard_on_close"
+    retain_encrypted = "retain_encrypted"
 
 
 # ── Declarative Base ──────────────────────────────────────────────────────────
@@ -909,7 +857,7 @@ class Incident(PlatformBase):
     )
     incident_type: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     severity: Mapped[str] = mapped_column(
-        Enum(SeverityEnum, name="severity_enum"), nullable=False, index=True
+        Enum(IncidentSeverityEnum, name="severity_enum"), nullable=False, index=True
     )
     description: Mapped[str] = mapped_column(Text, nullable=False)
     reported_at: Mapped[datetime] = mapped_column(

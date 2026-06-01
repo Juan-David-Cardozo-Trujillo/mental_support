@@ -70,7 +70,7 @@ class AppointmentItem(BaseModel):
     appointment_datetime: datetime
     status: str
     urgency_flag: bool
-    reason_for_visit: Optional[str]
+    reason_for_visit: Optional[str] = None
     confirmed_at: Optional[datetime]
 
 
@@ -151,8 +151,8 @@ async def get_counselor_schedule(
                 and_(
                     Appointment.counselor_id == counselor_id,
                     Appointment.status == "confirmed",
-                    Appointment.appointment_datetime > now,
-                    Appointment.appointment_datetime < future_date,
+                    Appointment.scheduled_time > now,
+                    Appointment.scheduled_time < future_date,
                 )
             )
         )
@@ -163,11 +163,11 @@ async def get_counselor_schedule(
             select(Appointment).where(
                 and_(
                     Appointment.counselor_id == counselor_id,
-                    Appointment.appointment_datetime > now,
-                    Appointment.appointment_datetime < future_date,
+                    Appointment.scheduled_time > now,
+                    Appointment.scheduled_time < future_date,
                 )
             ).order_by(
-                Appointment.appointment_datetime.asc()
+                Appointment.scheduled_time.asc()
             )
         )
         appointments = appts_result.scalars().all()
@@ -175,11 +175,11 @@ async def get_counselor_schedule(
         appt_items = [
             AppointmentItem(
                 id=str(a.id),
-                student_id=str(a.student_id),
-                appointment_datetime=a.appointment_datetime,
+                student_id=str(a.student_profile_id),
+                appointment_datetime=a.scheduled_time,
                 status=a.status,
                 urgency_flag=a.urgency_flag,
-                reason_for_visit=a.reason_for_visit,
+                reason_for_visit=None,
                 confirmed_at=a.confirmed_at,
             )
             for a in appointments
@@ -198,9 +198,10 @@ async def get_counselor_schedule(
         
         # Average rating
         rating_result = await db.execute(
-            select(func.avg(Feedback.rating)).where(
-                Feedback.counselor_id == counselor_id
-            )
+            select(func.avg(Feedback.overall_satisfaction))
+            .select_from(Feedback)
+            .join(Appointment)
+            .where(Appointment.counselor_id == counselor_id)
         )
         avg_rating = rating_result.scalar()
         
@@ -214,9 +215,10 @@ async def get_counselor_schedule(
         
         # Feedback count
         feedback_result = await db.execute(
-            select(func.count(Feedback.id)).where(
-                Feedback.counselor_id == counselor_id
-            )
+            select(func.count(Feedback.id))
+            .select_from(Feedback)
+            .join(Appointment)
+            .where(Appointment.counselor_id == counselor_id)
         )
         feedback_count = feedback_result.scalar() or 0
         
@@ -299,7 +301,7 @@ async def add_availability(
             counselor_id=uuid.UUID(counselor_id),
             slot_start=req.slot_start,
             slot_end=req.slot_end,
-            is_available=True,
+            booked=False,
             created_at=datetime.now(timezone.utc),
         )
         
@@ -378,15 +380,15 @@ async def get_upcoming_appointments(
         query = select(Appointment).where(
             and_(
                 Appointment.counselor_id == counselor_id,
-                Appointment.appointment_datetime > now,
-                Appointment.appointment_datetime < future_date,
+                Appointment.scheduled_time > now,
+                Appointment.scheduled_time < future_date,
             )
         )
         
         if status_filter:
             query = query.where(Appointment.status == status_filter)
         
-        query = query.order_by(Appointment.appointment_datetime.asc())
+        query = query.order_by(Appointment.scheduled_time.asc())
         
         result = await db.execute(query)
         appointments = result.scalars().all()
@@ -394,11 +396,11 @@ async def get_upcoming_appointments(
         return [
             AppointmentItem(
                 id=str(a.id),
-                student_id=str(a.student_id),
-                appointment_datetime=a.appointment_datetime,
+                student_id=str(a.student_profile_id),
+                appointment_datetime=a.scheduled_time,
                 status=a.status,
                 urgency_flag=a.urgency_flag,
-                reason_for_visit=a.reason_for_visit,
+                reason_for_visit=None,
                 confirmed_at=a.confirmed_at,
             )
             for a in appointments
@@ -450,9 +452,10 @@ async def get_performance_metrics(
         
         # Feedback count
         feedback_result = await db.execute(
-            select(func.count(Feedback.id)).where(
-                Feedback.counselor_id == counselor_id
-            )
+            select(func.count(Feedback.id))
+            .select_from(Feedback)
+            .join(Appointment)
+            .where(Appointment.counselor_id == counselor_id)
         )
         feedback_count = feedback_result.scalar() or 0
         

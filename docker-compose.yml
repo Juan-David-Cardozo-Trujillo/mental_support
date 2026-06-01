@@ -209,7 +209,7 @@ services:
       dockerfile: Dockerfile
     container_name: mindbridge_celery_worker
     restart: unless-stopped
-    command: celery -A app.celery_app worker --loglevel=info --concurrency=4 -Q default,email,reports
+    command: celery -A backend.tasks.celery_app worker --loglevel=info --concurrency=4 -Q default,email,reports
     env_file:
       - .env
     environment:
@@ -229,7 +229,7 @@ services:
     networks:
       - internal
     healthcheck:
-      test: ["CMD", "celery", "-A", "app.celery_app", "inspect", "ping"]
+      test: ["CMD", "celery", "-A", "backend.tasks.celery_app", "inspect", "ping"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -245,7 +245,7 @@ services:
       dockerfile: Dockerfile
     container_name: mindbridge_celery_beat
     restart: unless-stopped
-    command: celery -A app.celery_app beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    command: celery -A backend.tasks.celery_app beat --loglevel=info
     env_file:
       - .env
     environment:

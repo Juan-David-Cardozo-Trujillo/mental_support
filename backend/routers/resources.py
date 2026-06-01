@@ -51,7 +51,7 @@ class ResourceCreate(BaseModel):
     content: str = Field(..., description="Full content (HTML or Markdown)")
     content_type: str = Field(..., description="article | video | exercise | tool")
     category: str = Field(..., description="mental_health | coping | sleep | stress | etc.")
-    is_published: bool = Field(default=False, description="Published to platform")
+    active: bool = Field(default=False, description="Published to platform")
     external_url: Optional[str] = Field(None, description="External link (videos, etc.)")
     estimated_duration_minutes: Optional[int] = Field(None, description="Read/watch time")
 
@@ -112,7 +112,7 @@ async def list_resources(
     Returns: Paginated list of resources
     """
     try:
-        query = select(Resource).where(Resource.is_published == True)
+        query = select(Resource).where(Resource.active == True)
         
         # Apply filters
         if category:
@@ -166,7 +166,7 @@ async def get_resource(
             select(Resource).where(
                 and_(
                     Resource.id == resource_uuid,
-                    Resource.is_published == True
+                    Resource.active == True
                 )
             )
         )
@@ -261,7 +261,7 @@ async def get_categories(
                 Resource.category,
                 func.count(Resource.id).label("count")
             ).where(
-                Resource.is_published == True
+                Resource.active == True
             ).group_by(
                 Resource.category
             ).order_by(
@@ -332,7 +332,7 @@ async def create_resource(
             content=req.content,
             content_type=req.content_type,
             category=req.category,
-            is_published=req.is_published,
+            active=req.active,
             external_url=req.external_url,
             estimated_duration_minutes=req.estimated_duration_minutes,
             share_token=secrets.token_urlsafe(32),  # Random token for sharing
@@ -385,7 +385,7 @@ async def update_resource(
         resource.content = req.content
         resource.content_type = req.content_type
         resource.category = req.category
-        resource.is_published = req.is_published
+        resource.active = req.active
         resource.external_url = req.external_url
         resource.estimated_duration_minutes = req.estimated_duration_minutes
         resource.updated_at = datetime.now(timezone.utc)

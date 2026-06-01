@@ -69,10 +69,9 @@ class AppointmentResponse(BaseModel):
     id: str
     student_id: str
     counselor_id: str
-    appointment_datetime: datetime
+    scheduled_time: datetime
     status: str
     urgency_flag: bool
-    reason_for_visit: Optional[str]
     created_at: datetime
     confirmed_at: Optional[datetime]
     
@@ -113,10 +112,10 @@ async def _check_double_booking(
             and_(
                 Appointment.counselor_id == counselor_id,
                 Appointment.status == "confirmed",
-                Appointment.appointment_datetime < slot_end,
-                (Appointment.appointment_datetime + timedelta(minutes=60)) > appointment_datetime,
+                Appointment.scheduled_time < slot_end,
+                (Appointment.scheduled_time + timedelta(minutes=60)) > appointment_datetime,
             )
-        )
+        ).with_for_update()
     )
     
     overlap = result.scalar_one_or_none()
@@ -167,12 +166,12 @@ async def get_available_slots(
             JOIN counselor_availability ca ON pc.id = ca.counselor_id
             WHERE ca.slot_start > :now
               AND ca.slot_start < :future_date
-              AND ca.is_available = true
+              AND ca.booked = false
               AND NOT EXISTS (
                 SELECT 1 FROM appointments a
                 WHERE a.counselor_id = pc.id
                   AND a.status = 'confirmed'
-                  AND a.appointment_datetime = ca.slot_start
+                  AND a.scheduled_time = ca.slot_start
               )
             """),
             {"now": now, "future_date": future_date}
@@ -261,12 +260,11 @@ async def request_appointment(
         # Create appointment (status: pending until counselor confirms)
         appointment = Appointment(
             id=uuid.uuid4(),
-            student_id=uuid.UUID(current_user["profile_id"]),
+            student_profile_id=uuid.UUID(current_user["profile_id"]),
             counselor_id=uuid.UUID(req.counselor_id),
-            appointment_datetime=req.requested_datetime,
+            scheduled_time=req.requested_datetime,
             status="pending",
             urgency_flag=req.urgency_flag,
-            reason_for_visit=req.reason_for_visit,
             created_at=datetime.now(timezone.utc),
         )
         
@@ -321,7 +319,7 @@ async def get_appointment(
         # Verify access: student or counselor only
         is_student = (
             current_user["role"] == "student" and
-            str(appointment.student_id) == current_user["profile_id"]
+            str(appointment.student_profile_id) == current_user["profile_id"]
         )
         is_counselor = (
             current_user["role"] == "professional_counselor" and
@@ -426,7 +424,7 @@ async def cancel_appointment(
         # Verify ownership
         is_student = (
             current_user["role"] == "student" and
-            str(appointment.student_id) == current_user["profile_id"]
+            str(appointment.student_profile_id) == current_user["profile_id"]
         )
         is_counselor = (
             current_user["role"] == "professional_counselor" and
@@ -474,7 +472,7 @@ async def get_my_appointments(
         query = select(Appointment)
         
         if current_user["role"] == "student":
-            query = query.where(Appointment.student_id == uuid.UUID(current_user["profile_id"]))
+            query = query.where(Appointment.student_profile_id == uuid.UUID(current_user["profile_id"]))
         elif current_user["role"] == "professional_counselor":
             query = query.where(Appointment.counselor_id == uuid.UUID(current_user["profile_id"]))
         else:
@@ -487,7 +485,7 @@ async def get_my_appointments(
             query = query.where(Appointment.status == status_filter)
         
         # Order by appointment date, upcoming first
-        query = query.order_by(Appointment.appointment_datetime.asc())
+        query = query.order_by(Appointment.scheduled_time.asc())
         
         result = await db.execute(query)
         appointments = result.scalars().all()

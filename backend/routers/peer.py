@@ -188,10 +188,9 @@ async def get_peer_dashboard(
     try:
         peer_id = current_user["profile_id"]
         
-        # Get peer profile
         peer_result = await db.execute(
             select(PeerCounselorProfile).where(
-                PeerCounselorProfile.id == peer_id
+                PeerCounselorProfile.profile_id == peer_id
             )
         )
         peer = peer_result.scalar_one_or_none()
@@ -204,16 +203,22 @@ async def get_peer_dashboard(
         
         # Get average feedback rating
         rating_result = await db.execute(
-            select(func.avg(Feedback.rating)).where(
-                Feedback.peer_id == peer_id
-            )
+            select(func.avg(Feedback.overall_satisfaction))
+            .select_from(Feedback)
+            .join(ChatSession)
+            .where(ChatSession.peer_counselor_profile_id == peer.id)
         )
         avg_rating = rating_result.scalar()
         
         # Count total messages sent
         messages_result = await db.execute(
-            select(func.count(ChatMessage.id)).where(
-                ChatMessage.sender_id == peer_id
+            select(func.count(ChatMessage.id))
+            .join(ChatSession)
+            .where(
+                and_(
+                    ChatSession.peer_counselor_profile_id == peer.id,
+                    ChatMessage.sender_role == "peer_counselor"
+                )
             )
         )
         total_messages = messages_result.scalar() or 0
@@ -221,7 +226,7 @@ async def get_peer_dashboard(
         # Count badges
         badges_result = await db.execute(
             select(func.count(RecognitionBadge.id)).where(
-                RecognitionBadge.peer_id == peer_id
+                RecognitionBadge.peer_profile_id == peer.id
             )
         )
         badges_count = badges_result.scalar() or 0
@@ -230,8 +235,8 @@ async def get_peer_dashboard(
         training_result = await db.execute(
             select(TrainingCompletion).where(
                 and_(
-                    TrainingCompletion.peer_id == peer_id,
-                    TrainingCompletion.completion_date.isnot(None)
+                    TrainingCompletion.peer_profile_id == peer.id,
+                    TrainingCompletion.completed_at.isnot(None)
                 )
             )
         )
@@ -295,7 +300,7 @@ async def get_wellness_check(
         
         peer_result = await db.execute(
             select(PeerCounselorProfile).where(
-                PeerCounselorProfile.id == peer_id
+                PeerCounselorProfile.profile_id == peer_id
             )
         )
         peer = peer_result.scalar_one_or_none()
@@ -342,7 +347,7 @@ async def toggle_availability(
         
         peer_result = await db.execute(
             select(PeerCounselorProfile).where(
-                PeerCounselorProfile.id == peer_id
+                PeerCounselorProfile.profile_id == peer_id
             )
         )
         peer = peer_result.scalar_one_or_none()
@@ -388,16 +393,21 @@ async def get_session_history(
     - limit: Max results (default 50)
     """
     try:
-        peer_id = current_user["profile_id"]
-        
+        peer_result = await db.execute(
+            select(PeerCounselorProfile).where(PeerCounselorProfile.profile_id == peer_id)
+        )
+        peer = peer_result.scalar_one_or_none()
+        if not peer:
+            raise HTTPException(status_code=404, detail="Peer profile not found")
+
         query = select(ChatSession).where(
-            ChatSession.peer_id == peer_id
+            ChatSession.peer_counselor_profile_id == peer.id
         )
         
         if status_filter:
             query = query.where(ChatSession.session_status == status_filter)
         
-        query = query.order_by(ChatSession.created_at.desc()).limit(limit)
+        query = query.order_by(ChatSession.started_at.desc()).limit(limit)
         
         result = await db.execute(query)
         sessions = result.scalars().all()
@@ -415,25 +425,25 @@ async def get_session_history(
             # Get feedback if exists
             feedback_result = await db.execute(
                 select(Feedback).where(
-                    Feedback.chat_session_id == session.id
+                    Feedback.session_id == session.id
                 )
             )
             feedback = feedback_result.scalar_one_or_none()
             
             duration = None
             if session.ended_at:
-                duration = (session.ended_at - session.created_at).total_seconds() / 60
+                duration = (session.ended_at - session.started_at).total_seconds() / 60
             
             history.append(
                 SessionHistoryItem(
                     session_id=str(session.id),
-                    student_anonymous_profile_id=str(session.student_id),
+                    student_anonymous_profile_id=str(session.student_profile_id),
                     session_status=session.session_status,
                     messages_count=msg_count,
                     duration_minutes=duration,
-                    feedback_rating=feedback.rating if feedback else None,
-                    feedback_text=feedback.feedback_text if feedback else None,
-                    started_at=session.created_at,
+                    feedback_rating=feedback.overall_satisfaction if feedback else None,
+                    feedback_text=None,
+                    started_at=session.started_at,
                     ended_at=session.ended_at,
                 )
             )
@@ -456,11 +466,15 @@ async def get_badges(
 ):
     """Get all recognition badges earned."""
     try:
-        peer_id = current_user["profile_id"]
+        peer_result = await db.execute(
+            select(PeerCounselorProfile).where(PeerCounselorProfile.profile_id == peer_id)
+        )
+        peer = peer_result.scalar_one_or_none()
+        if not peer: return []
         
         result = await db.execute(
             select(RecognitionBadge).where(
-                RecognitionBadge.peer_id == peer_id
+                RecognitionBadge.peer_profile_id == peer.id
             ).order_by(
                 RecognitionBadge.awarded_at.desc()
             )
@@ -492,13 +506,15 @@ async def get_training_progress(
 ):
     """Get training module completion status."""
     try:
-        peer_id = current_user["profile_id"]
+        peer_result = await db.execute(
+            select(PeerCounselorProfile).where(PeerCounselorProfile.profile_id == peer_id)
+        )
+        peer = peer_result.scalar_one_or_none()
+        if not peer: return []
         
         result = await db.execute(
             select(TrainingCompletion).where(
-                TrainingCompletion.peer_id == peer_id
-            ).order_by(
-                TrainingCompletion.started_at.asc()
+                TrainingCompletion.peer_profile_id == peer.id
             )
         )
         
@@ -506,9 +522,9 @@ async def get_training_progress(
         
         return [
             TrainingProgress(
-                module_name=c.module_name,
-                status="completed" if c.completion_date else "in_progress",
-                completion_date=c.completion_date,
+                module_name=str(c.module_id),
+                status="completed" if c.completed_at else "in_progress",
+                completion_date=c.completed_at,
                 score=c.score,
             )
             for c in completions

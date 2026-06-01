@@ -208,11 +208,12 @@ def create_app() -> FastAPI:
         # Check databases (simple ping via connection pool)
         try:
             from backend.core.database import auth_engine, platform_engine
+            from sqlalchemy import text
 
             async with auth_engine.connect() as conn:
-                await conn.execute("SELECT 1")
+                await conn.execute(text("SELECT 1"))
             async with platform_engine.connect() as conn:
-                await conn.execute("SELECT 1")
+                await conn.execute(text("SELECT 1"))
             checks["database"] = "ok"
         except Exception as exc:
             logger.warning(f"Database health check failed: {exc}")
@@ -228,7 +229,6 @@ def create_app() -> FastAPI:
         auth,
         assessment,
         matching,
-        chat,
         appointments,
         resources,
         peer,
@@ -241,7 +241,6 @@ def create_app() -> FastAPI:
     app.include_router(auth.router, prefix=api_v1_prefix)
     app.include_router(assessment.router, prefix=api_v1_prefix)
     app.include_router(matching.router, prefix=api_v1_prefix)
-    app.include_router(chat.router, prefix=api_v1_prefix)
     
     # Priority 2: MVP modules
     app.include_router(appointments.router, prefix=api_v1_prefix)

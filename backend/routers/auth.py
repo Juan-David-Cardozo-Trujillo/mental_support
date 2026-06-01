@@ -137,17 +137,26 @@ async def sso_callback(
             )
             token_response.raise_for_status()
             token_data = token_response.json()
+            
+            # Fetch user info
+            access_token = token_data.get("access_token")
+            userinfo_response = await client.get(
+                settings.SSO_USERINFO_URL,
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+            userinfo_response.raise_for_status()
+            userinfo_data = userinfo_response.json()
+            
     except Exception as exc:
-        logger.error(f"SSO token exchange failed: {exc}")
+        logger.error(f"SSO exchange failed: {exc}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"code": "SSO_ERROR", "message": "Failed to exchange code for token"},
+            detail={"code": "SSO_ERROR", "message": "Failed to exchange code or fetch user info"},
         ) from exc
 
-    # Extract identity claims from token
-    access_token = token_data.get("access_token")
-    sso_user_id = token_data.get("sub") or token_data.get("user_id")  # varies by provider
-    sso_role = token_data.get("role", "student")  # default role if not provided
+    # Extract identity claims
+    sso_user_id = userinfo_data.get("sub") or userinfo_data.get("user_id")
+    sso_role = userinfo_data.get("role", "student")
 
     # Hash token for storage (RULE-01: never store raw token)
     token_hash = hash_value(access_token)

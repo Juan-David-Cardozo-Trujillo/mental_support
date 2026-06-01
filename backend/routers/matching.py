@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 from redis.asyncio import Redis
 from sqlalchemy import and_, desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -118,9 +118,9 @@ async def _remove_from_queue(redis: Redis, student_profile_id: str) -> None:
 
 @router.post("/request")
 async def request_match(
+    request: Request,
     user: dict = Depends(consent_required),
     db: AsyncSession = Depends(get_platform_db),
-    request_obj: Any = None,
 ) -> MatchingResponse:
     """
     Request a match with an available peer counselor.
@@ -141,7 +141,7 @@ async def request_match(
     }
     """
     student_profile_id = UUID(user.get("sub"))
-    redis: Redis = request_obj.app.state.redis if request_obj else None
+    redis: Redis = request.app.state.redis
 
     # Fetch student's needs assessment
     stmt = (
@@ -235,8 +235,8 @@ async def request_match(
 
 @router.get("/queue-status")
 async def get_queue_status(
+    request: Request,
     user: dict = Depends(consent_required),
-    request_obj: Any = None,
 ) -> dict[str, Any]:
     """
     Get the current user's queue position and estimated wait time.
@@ -251,7 +251,7 @@ async def get_queue_status(
     If the user is not in the queue, returns position=null.
     """
     student_profile_id = str(user.get("sub"))
-    redis: Redis | None = request_obj.app.state.redis if request_obj else None
+    redis: Redis = request.app.state.redis
 
     if not redis:
         return {"position": None, "estimated_wait_minutes": None, "message": "Queue unavailable"}
