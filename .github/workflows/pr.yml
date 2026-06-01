@@ -1,0 +1,293 @@
+name: PR Checks
+
+on:
+  pull_request:
+    branches: [main, develop]
+  workflow_call: {}   # Allow this workflow to be called from main.yml
+
+concurrency:
+  group: pr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ============================================================
+  # JOB 1: Lint (Python + JavaScript/TypeScript)
+  # ============================================================
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python linting tools
+        run: |
+          pip install flake8==7.0.0 flake8-bugbear flake8-isort black isort
+
+      - name: Run flake8 (Python LINT)
+        run: |
+          flake8 backend/ \
+            --max-line-length=120 \
+            --extend-ignore=E203,W503 \
+            --exclude=backend/.venv,backend/__pycache__,backend/migrations \
+            --format='%(path)s:%(row)d:%(col)d: %(code)s %(text)s'
+
+      - name: Check black formatting
+        run: |
+          black --check --line-length=120 backend/
+
+      - name: Check isort import ordering
+        run: |
+          isort --check-only --diff backend/
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: cd frontend && npm ci
+
+      - name: Run ESLint
+        run: cd frontend && npm run lint -- --max-warnings=0
+
+      - name: Check TypeScript compilation
+        run: cd frontend && npm run type-check
+
+  # ============================================================
+  # JOB 2: Unit Tests (Backend + Frontend)
+  # ============================================================
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    services:
+      auth_db:
+        image: postgres:16
+        env:
+          POSTGRES_DB: auth_service_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - "5432:5432"
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      platform_db:
+        image: postgres:16
+        env:
+          POSTGRES_DB: platform_db_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - "5433:5432"
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - "6379:6379"
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_AUTH_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/auth_service_test
+      DATABASE_PLATFORM_URL: postgresql+asyncpg://postgres:postgres@localhost:5433/platform_db_test
+      REDIS_URL: redis://localhost:6379/0
+      CELERY_BROKER_URL: redis://localhost:6379/1
+      CELERY_RESULT_BACKEND: redis://localhost:6379/2
+      JWT_SECRET: test-jwt-secret-256bit-placeholder-for-ci-only
+      AES_KEY: aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd
+      SSO_CLIENT_ID: mental-health-platform
+      SSO_CLIENT_SECRET: test-sso-secret
+      SSO_AUTHORIZATION_URL: http://localhost:8080/authorize
+      SSO_TOKEN_URL: http://localhost:8080/token
+      SSO_USERINFO_URL: http://localhost:8080/userinfo
+      ENV: test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install backend dependencies
+        run: |
+          pip install -r backend/requirements.txt
+          pip install pytest pytest-asyncio pytest-cov pytest-mock httpx anyio
+
+      - name: Run database migrations (test DB)
+        run: |
+          cd backend
+          alembic -c alembic_auth.ini upgrade head
+          alembic -c alembic_platform.ini upgrade head
+
+      - name: Run backend unit tests with coverage
+        run: |
+          pytest backend/tests/ \
+            --cov=backend \
+            --cov-report=xml:coverage-backend.xml \
+            --cov-report=term-missing \
+            --cov-fail-under=80 \
+            -v \
+            --tb=short \
+            -x
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: cd frontend && npm ci
+
+      - name: Run frontend unit tests with coverage
+        run: |
+          cd frontend && npm test -- \
+            --coverage \
+            --watchAll=false \
+            --coverageThreshold='{"global":{"branches":75,"functions":80,"lines":80,"statements":80}}' \
+            --ci
+
+      - name: Upload backend coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage-backend.xml
+          flags: backend
+          name: backend-coverage
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+      - name: Upload frontend coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./frontend/coverage/lcov.info
+          flags: frontend
+          name: frontend-coverage
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+  # ============================================================
+  # JOB 3: Security Scan
+  # ============================================================
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install security tools
+        run: pip install bandit[toml]==1.7.8 safety
+
+      - name: Run Bandit (Python SAST)
+        run: |
+          bandit -r backend/ \
+            -ll \
+            --exclude backend/tests,backend/.venv,backend/migrations \
+            -f json \
+            -o bandit-report.json || true
+          bandit -r backend/ \
+            -ll \
+            --exclude backend/tests,backend/.venv,backend/migrations
+        # -ll = only HIGH and MEDIUM severity findings
+
+      - name: Check Python dependency vulnerabilities (safety)
+        run: |
+          safety check \
+            -r backend/requirements.txt \
+            --full-report \
+            --ignore 70612
+        continue-on-error: false
+
+      - name: Run Semgrep (SAST)
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/security-audit
+            p/python
+            p/javascript
+            p/typescript
+            p/secrets
+            p/owasp-top-ten
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+      - name: Set up Node.js 20 (for npm audit)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: cd frontend && npm ci
+
+      - name: Run npm audit (frontend)
+        run: |
+          cd frontend && npm audit --audit-level=high --json > npm-audit.json || true
+          cd frontend && npm audit --audit-level=high
+
+      - name: Upload security reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: |
+            bandit-report.json
+            frontend/npm-audit.json
+          retention-days: 30
+
+  # ============================================================
+  # JOB 4: PR Gate — Block merge on any failure
+  # ============================================================
+  pr-gate:
+    name: PR Gate (All Checks Passed)
+    runs-on: ubuntu-latest
+    needs: [lint, unit-tests, security-scan]
+    if: always()
+    steps:
+      - name: Check all jobs passed
+        run: |
+          if [[ "${{ needs.lint.result }}" != "success" ]]; then
+            echo "❌ Lint job failed"
+            exit 1
+          fi
+          if [[ "${{ needs.unit-tests.result }}" != "success" ]]; then
+            echo "❌ Unit tests job failed"
+            exit 1
+          fi
+          if [[ "${{ needs.security-scan.result }}" != "success" ]]; then
+            echo "❌ Security scan job failed"
+            exit 1
+          fi
+          echo "✅ All PR checks passed — ready to merge"

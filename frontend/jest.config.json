@@ -1,0 +1,25 @@
+{
+  "testEnvironment": "jsdom",
+  "setupFilesAfterEnv": ["<rootDir>/src/test/setup.js"],
+  "moduleNameMapper": {
+    "\\.(css|less|scss|sass)$": "identity-obj-proxy",
+    "\\.(jpg|jpeg|png|gif|svg)$": "<rootDir>/src/test/__mocks__/fileMock.js"
+  },
+  "transform": {
+    "^.+\\.(jsx?|tsx?)$": ["babel-jest", { "presets": ["@babel/preset-react"] }]
+  },
+  "collectCoverageFrom": [
+    "src/**/*.{js,jsx}",
+    "!src/main.jsx",
+    "!src/test/**"
+  ],
+  "coveragePathIgnorePatterns": [
+    "/node_modules/",
+    "/dist/",
+    "/coverage/"
+  ],
+  "testMatch": [
+    "**/__tests__/**/*.test.{js,jsx}",
+    "**/*.test.{js,jsx}"
+  ]
+}

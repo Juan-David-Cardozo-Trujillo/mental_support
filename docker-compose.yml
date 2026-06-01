@@ -1,0 +1,297 @@
+version: "3.9"
+
+# ============================================================
+# MindBridge – Student Mental Health Support Platform
+# Full Local Development Stack
+# ============================================================
+
+networks:
+  internal:
+    driver: bridge
+  public:
+    driver: bridge
+
+volumes:
+  auth_db_data:
+  platform_db_data:
+  redis_data:
+
+services:
+
+  # ----------------------------------------------------------
+  # AUTH DATABASE (port 5432)
+  # Dedicated PostgreSQL instance for auth_service
+  # ----------------------------------------------------------
+  auth_db:
+    image: postgres:16
+    container_name: mindbridge_auth_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: auth_service
+      POSTGRES_USER: ${AUTH_DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${AUTH_DB_PASSWORD:-postgres}
+    ports:
+      - "5432:5432"
+    volumes:
+      - auth_db_data:/var/lib/postgresql/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AUTH_DB_USER:-postgres} -d auth_service"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ----------------------------------------------------------
+  # PLATFORM DATABASE (port 5433)
+  # Separate PostgreSQL instance for all platform data
+  # ----------------------------------------------------------
+  platform_db:
+    image: postgres:16
+    container_name: mindbridge_platform_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: platform_db
+      POSTGRES_USER: ${PLATFORM_DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${PLATFORM_DB_PASSWORD:-postgres}
+    ports:
+      - "5433:5432"
+    volumes:
+      - platform_db_data:/var/lib/postgresql/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PLATFORM_DB_USER:-postgres} -d platform_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ----------------------------------------------------------
+  # REDIS (port 6379)
+  # Used for: session cache, Celery broker/result, rate limiting
+  # ----------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: mindbridge_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redispassword}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redispassword}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ----------------------------------------------------------
+  # MOCK SSO (port 8080)
+  # OAuth 2.0 authorization_code flow for local development
+  # ----------------------------------------------------------
+  mock_sso:
+    build:
+      context: ./mock_sso
+      dockerfile: Dockerfile
+    container_name: mindbridge_mock_sso
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      SSO_CLIENT_ID: ${SSO_CLIENT_ID:-mental-health-platform}
+      SSO_CLIENT_SECRET: ${SSO_CLIENT_SECRET:-dev-secret}
+    ports:
+      - "8080:8080"
+    networks:
+      - internal
+      - public
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ----------------------------------------------------------
+  # BACKEND (port 8000)
+  # FastAPI application – all REST API endpoints
+  # ----------------------------------------------------------
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: mindbridge_backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_AUTH_URL: postgresql+asyncpg://${AUTH_DB_USER:-postgres}:${AUTH_DB_PASSWORD:-postgres}@auth_db:5432/auth_service
+      DATABASE_PLATFORM_URL: postgresql+asyncpg://${PLATFORM_DB_USER:-postgres}:${PLATFORM_DB_PASSWORD:-postgres}@platform_db:5432/platform_db
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redispassword}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-redispassword}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-redispassword}@redis:6379/2
+      SSO_AUTHORIZATION_URL: http://mock_sso:8080/authorize
+      SSO_TOKEN_URL: http://mock_sso:8080/token
+      SSO_USERINFO_URL: http://mock_sso:8080/userinfo
+      ENV: development
+    ports:
+      - "8000:8000"
+    depends_on:
+      auth_db:
+        condition: service_healthy
+      platform_db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mock_sso:
+        condition: service_healthy
+    networks:
+      - internal
+      - public
+    volumes:
+      - ./backend:/app
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  # ----------------------------------------------------------
+  # CHAT SERVICE (port 8001)
+  # Isolated WebSocket service for real-time chat
+  # ----------------------------------------------------------
+  chat_service:
+    build:
+      context: ./chat_service
+      dockerfile: Dockerfile
+    container_name: mindbridge_chat_service
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_PLATFORM_URL: postgresql+asyncpg://${PLATFORM_DB_USER:-postgres}:${PLATFORM_DB_PASSWORD:-postgres}@platform_db:5432/platform_db
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redispassword}@redis:6379/0
+      JWT_SECRET: ${JWT_SECRET}
+      AES_KEY: ${AES_KEY}
+      ENV: development
+    ports:
+      - "8001:8001"
+    depends_on:
+      platform_db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    networks:
+      - internal
+      - public
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  # ----------------------------------------------------------
+  # CELERY WORKER
+  # Async task processor: emails, burnout scoring, reports
+  # ----------------------------------------------------------
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: mindbridge_celery_worker
+    restart: unless-stopped
+    command: celery -A app.celery_app worker --loglevel=info --concurrency=4 -Q default,email,reports
+    env_file:
+      - .env
+    environment:
+      DATABASE_AUTH_URL: postgresql+asyncpg://${AUTH_DB_USER:-postgres}:${AUTH_DB_PASSWORD:-postgres}@auth_db:5432/auth_service
+      DATABASE_PLATFORM_URL: postgresql+asyncpg://${PLATFORM_DB_USER:-postgres}:${PLATFORM_DB_PASSWORD:-postgres}@platform_db:5432/platform_db
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redispassword}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-redispassword}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-redispassword}@redis:6379/2
+      ENV: development
+    depends_on:
+      redis:
+        condition: service_healthy
+      auth_db:
+        condition: service_healthy
+      platform_db:
+        condition: service_healthy
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "celery", "-A", "app.celery_app", "inspect", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ----------------------------------------------------------
+  # CELERY BEAT
+  # Periodic task scheduler: retention purge, burnout checks
+  # ----------------------------------------------------------
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: mindbridge_celery_beat
+    restart: unless-stopped
+    command: celery -A app.celery_app beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    env_file:
+      - .env
+    environment:
+      DATABASE_AUTH_URL: postgresql+asyncpg://${AUTH_DB_USER:-postgres}:${AUTH_DB_PASSWORD:-postgres}@auth_db:5432/auth_service
+      DATABASE_PLATFORM_URL: postgresql+asyncpg://${PLATFORM_DB_USER:-postgres}:${PLATFORM_DB_PASSWORD:-postgres}@platform_db:5432/platform_db
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redispassword}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-redispassword}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-redispassword}@redis:6379/2
+      ENV: development
+    depends_on:
+      redis:
+        condition: service_healthy
+      platform_db:
+        condition: service_healthy
+    networks:
+      - internal
+
+  # ----------------------------------------------------------
+  # FRONTEND (port 3000)
+  # Vite + React dev server with hot module replacement
+  # ----------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: mindbridge_frontend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      VITE_API_URL: http://localhost:8000
+      VITE_CHAT_URL: ws://localhost:8001
+      VITE_ENV: development
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - public
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s

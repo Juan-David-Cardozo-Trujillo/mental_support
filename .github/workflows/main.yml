@@ -1,0 +1,407 @@
+name: Staging Deployment (Main Branch)
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: staging-deploy
+  cancel-in-progress: false   # Never cancel a running deploy
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+  ECS_CLUSTER: mindbridge-staging
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  # ============================================================
+  # STEP 1: Run all PR checks (reuse pr.yml)
+  # ============================================================
+  pr-checks:
+    name: PR Checks
+    uses: ./.github/workflows/pr.yml
+    secrets: inherit
+
+  # ============================================================
+  # STEP 2: Integration Tests
+  # ============================================================
+  integration-tests:
+    name: Integration Tests
+    needs: pr-checks
+    runs-on: ubuntu-latest
+    services:
+      auth_db:
+        image: postgres:16
+        env:
+          POSTGRES_DB: auth_service_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      platform_db:
+        image: postgres:16
+        env:
+          POSTGRES_DB: platform_db_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports: ["5433:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_AUTH_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/auth_service_test
+      DATABASE_PLATFORM_URL: postgresql+asyncpg://postgres:postgres@localhost:5433/platform_db_test
+      REDIS_URL: redis://localhost:6379/0
+      CELERY_BROKER_URL: redis://localhost:6379/1
+      CELERY_RESULT_BACKEND: redis://localhost:6379/2
+      JWT_SECRET: integration-test-jwt-secret-ci-only-not-for-production
+      AES_KEY: aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd
+      SSO_CLIENT_ID: mental-health-platform
+      SSO_CLIENT_SECRET: test-sso-secret-ci
+      ENV: test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r backend/requirements.txt
+          pip install pytest pytest-asyncio httpx anyio
+
+      - name: Start mock_sso
+        run: |
+          pip install fastapi uvicorn[standard] httpx python-multipart
+          cd mock_sso && uvicorn main:app --host 0.0.0.0 --port 8080 &
+          sleep 5
+          curl -f http://localhost:8080/health || exit 1
+
+      - name: Run migrations
+        run: |
+          cd backend
+          alembic -c alembic_auth.ini upgrade head
+          alembic -c alembic_platform.ini upgrade head
+
+      - name: Start backend API
+        run: |
+          cd backend
+          uvicorn app.main:app --host 0.0.0.0 --port 8000 &
+          sleep 10
+          curl -f http://localhost:8000/health || exit 1
+
+      - name: Run integration tests
+        run: |
+          pytest backend/tests/integration/ \
+            -v \
+            --tb=short \
+            -x \
+            --timeout=60 \
+            -m integration
+
+      - name: Run API contract tests
+        run: |
+          pytest backend/tests/contract/ \
+            -v \
+            --tb=short \
+            -x \
+            -m contract
+
+  # ============================================================
+  # STEP 3: Build & Push Docker Images to ECR
+  # ============================================================
+  docker-build:
+    name: Docker Build & Push
+    needs: integration-tests
+    runs-on: ubuntu-latest
+    outputs:
+      backend-image: ${{ steps.build-backend.outputs.image }}
+      chat-image: ${{ steps.build-chat.outputs.image }}
+      frontend-image: ${{ steps.build-frontend.outputs.image }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push backend image
+        id: build-backend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/mindbridge-backend:${{ env.IMAGE_TAG }}
+            ${{ env.ECR_REGISTRY }}/mindbridge-backend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            GIT_COMMIT=${{ github.sha }}
+
+      - name: Build and push chat_service image
+        id: build-chat
+        uses: docker/build-push-action@v5
+        with:
+          context: ./chat_service
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/mindbridge-chat:${{ env.IMAGE_TAG }}
+            ${{ env.ECR_REGISTRY }}/mindbridge-chat:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push frontend image
+        id: build-frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/mindbridge-frontend:${{ env.IMAGE_TAG }}
+            ${{ env.ECR_REGISTRY }}/mindbridge-frontend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VITE_API_URL=${{ secrets.STAGING_API_URL }}
+            VITE_CHAT_URL=${{ secrets.STAGING_CHAT_URL }}
+
+      - name: Run Trivy container security scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.ECR_REGISTRY }}/mindbridge-backend:${{ env.IMAGE_TAG }}"
+          format: "sarif"
+          output: "trivy-backend.sarif"
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-backend.sarif"
+
+  # ============================================================
+  # STEP 4: Deploy to Staging (ECS Rolling Update)
+  # ============================================================
+  deploy-staging:
+    name: Deploy to Staging
+    needs: docker-build
+    runs-on: ubuntu-latest
+    environment: staging
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download current task definitions
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition mindbridge-backend-staging \
+            --query taskDefinition > backend-task-def.json
+          aws ecs describe-task-definition \
+            --task-definition mindbridge-chat-staging \
+            --query taskDefinition > chat-task-def.json
+          aws ecs describe-task-definition \
+            --task-definition mindbridge-frontend-staging \
+            --query taskDefinition > frontend-task-def.json
+
+      - name: Update backend task definition image
+        id: render-backend-td
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: backend-task-def.json
+          container-name: backend
+          image: ${{ env.ECR_REGISTRY }}/mindbridge-backend:${{ env.IMAGE_TAG }}
+
+      - name: Deploy backend to ECS staging
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.render-backend-td.outputs.task-definition }}
+          service: mindbridge-backend-staging
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Update chat service task definition image
+        id: render-chat-td
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: chat-task-def.json
+          container-name: chat_service
+          image: ${{ env.ECR_REGISTRY }}/mindbridge-chat:${{ env.IMAGE_TAG }}
+
+      - name: Deploy chat service to ECS staging
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.render-chat-td.outputs.task-definition }}
+          service: mindbridge-chat-staging
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Update frontend task definition image
+        id: render-frontend-td
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: frontend-task-def.json
+          container-name: frontend
+          image: ${{ env.ECR_REGISTRY }}/mindbridge-frontend:${{ env.IMAGE_TAG }}
+
+      - name: Deploy frontend to ECS staging
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.render-frontend-td.outputs.task-definition }}
+          service: mindbridge-frontend-staging
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+  # ============================================================
+  # STEP 5: OWASP ZAP Security Scan against Staging
+  # ============================================================
+  owasp-zap:
+    name: OWASP ZAP Scan
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Wait for staging to be fully ready
+        run: |
+          MAX_RETRIES=30
+          RETRY=0
+          until curl -sf "${{ secrets.STAGING_URL }}/health" | grep -q '"status":"ok"'; do
+            RETRY=$((RETRY+1))
+            if [ $RETRY -ge $MAX_RETRIES ]; then
+              echo "Staging never became healthy"
+              exit 1
+            fi
+            echo "Waiting for staging... ($RETRY/$MAX_RETRIES)"
+            sleep 10
+          done
+          echo "Staging is healthy"
+
+      - name: OWASP ZAP Full Scan
+        uses: zaproxy/action-full-scan@v0.10.0
+        with:
+          target: "${{ secrets.STAGING_URL }}"
+          rules_file_name: ".github/zap-rules.tsv"
+          cmd_options: "-a -j -l WARN"
+          fail_action: true
+          allow_issue_writing: false
+
+      - name: Upload ZAP scan report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-scan-report
+          path: report_html.html
+          retention-days: 30
+
+      - name: Check for CVSS >= 7.0 vulnerabilities
+        if: always()
+        run: |
+          if [ -f "report_json.json" ]; then
+            HIGH_VULNS=$(python3 -c "
+          import json, sys
+          with open('report_json.json') as f:
+              data = json.load(f)
+          high = [a for site in data.get('site', []) for a in site.get('alerts', []) if int(a.get('riskcode', 0)) >= 3]
+          print(len(high))
+          ")
+            if [ "$HIGH_VULNS" -gt 0 ]; then
+              echo "BLOCKED: $HIGH_VULNS HIGH/CRITICAL vulnerabilities found (CVSS >= 7.0)"
+              exit 1
+            fi
+            echo "ZAP scan passed — no CVSS >= 7.0 vulnerabilities"
+          fi
+
+  # ============================================================
+  # STEP 6: Staging Health Check & Smoke Tests
+  # ============================================================
+  staging-smoke-tests:
+    name: Staging Smoke Tests
+    needs: owasp-zap
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test tools
+        run: pip install httpx pytest pytest-asyncio
+
+      - name: Health check all modules
+        run: |
+          STAGING_URL="${{ secrets.STAGING_URL }}"
+          MODULES=("auth" "matching" "chat" "appointments" "resources" "peer" "admin")
+          FAILED=0
+          for module in "${MODULES[@]}"; do
+            STATUS=$(curl -sf "$STAGING_URL/health/$module" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || echo "error")
+            if [ "$STATUS" != "ok" ]; then
+              echo "❌ Health check FAILED for module: $module (status=$STATUS)"
+              FAILED=$((FAILED+1))
+            else
+              echo "✅ $module: ok"
+            fi
+          done
+          if [ $FAILED -gt 0 ]; then
+            echo "$FAILED module(s) failed health checks"
+            exit 1
+          fi
+
+      - name: Run staging smoke tests
+        env:
+          STAGING_URL: ${{ secrets.STAGING_URL }}
+        run: |
+          pytest backend/tests/smoke/ \
+            -v \
+            --tb=short \
+            -m smoke \
+            --base-url="$STAGING_URL"

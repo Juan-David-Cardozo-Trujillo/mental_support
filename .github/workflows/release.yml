@@ -1,0 +1,561 @@
+name: Production Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"        # e.g. v1.2.3
+      - "v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+" # e.g. v1.2.3-rc1
+
+concurrency:
+  group: production-release
+  cancel-in-progress: false   # Never cancel a production deploy
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+  ECS_CLUSTER: mindbridge-production
+  RELEASE_TAG: ${{ github.ref_name }}
+
+jobs:
+  # ============================================================
+  # GATE 1: Privacy Impact Assessment (PIA) Check
+  # BLOCKS release if any open PIA-required issues exist
+  # ============================================================
+  pia-gate:
+    name: PIA Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check for open PIA issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Checking for open PIA-required GitHub issues..."
+          OPEN_PIAS=$(gh issue list \
+            --label "pia-required" \
+            --state open \
+            --json number,title \
+            --jq 'length')
+
+          echo "Open PIA issues found: $OPEN_PIAS"
+
+          if [ "$OPEN_PIAS" -gt 0 ]; then
+            echo ""
+            echo "================================================"
+            echo "🚫 PRODUCTION RELEASE BLOCKED"
+            echo "================================================"
+            echo "Found $OPEN_PIAS open Privacy Impact Assessment issue(s)."
+            echo "All PIA issues must be CLOSED before deploying to production."
+            echo ""
+            echo "Open PIA issues:"
+            gh issue list \
+              --label "pia-required" \
+              --state open \
+              --json number,title \
+              --jq '.[] | "  #\(.number): \(.title)"'
+            echo ""
+            echo "Resolution steps:"
+            echo "  1. Complete all checklist items in each open PIA issue"
+            echo "  2. Get approval from Privacy Officer, University DPO, and Platform Admin Lead"
+            echo "  3. Close the PIA issue(s)"
+            echo "  4. Re-push the release tag"
+            exit 1
+          fi
+
+          echo "✅ PIA Gate passed — no open PIA issues"
+
+      - name: Verify PIA was completed for this version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Check that there is at least one CLOSED PIA issue referencing this version
+          CLOSED_PIAS=$(gh issue list \
+            --label "pia-required" \
+            --state closed \
+            --json number,title \
+            --jq "map(select(.title | contains(\"${{ env.RELEASE_TAG }}\"))) | length")
+
+          echo "Closed PIA issues for ${{ env.RELEASE_TAG }}: $CLOSED_PIAS"
+
+          if [ "$CLOSED_PIAS" -eq 0 ]; then
+            echo "⚠️  WARNING: No closed PIA issue found specifically for ${{ env.RELEASE_TAG }}"
+            echo "   Please ensure a PIA was completed for this release version."
+            # Warn but don't block (may use a general PIA cycle)
+          else
+            echo "✅ Found $CLOSED_PIAS closed PIA issue(s) for ${{ env.RELEASE_TAG }}"
+          fi
+
+  # ============================================================
+  # GATE 2: All PR Checks Must Pass
+  # ============================================================
+  all-checks:
+    name: All Checks
+    needs: pia-gate
+    uses: ./.github/workflows/pr.yml
+    secrets: inherit
+
+  # ============================================================
+  # GATE 3: Integration Tests
+  # ============================================================
+  integration-tests:
+    name: Integration Tests
+    needs: all-checks
+    runs-on: ubuntu-latest
+    services:
+      auth_db:
+        image: postgres:16
+        env:
+          POSTGRES_DB: auth_service_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      platform_db:
+        image: postgres:16
+        env:
+          POSTGRES_DB: platform_db_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports: ["5433:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_AUTH_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/auth_service_test
+      DATABASE_PLATFORM_URL: postgresql+asyncpg://postgres:postgres@localhost:5433/platform_db_test
+      REDIS_URL: redis://localhost:6379/0
+      CELERY_BROKER_URL: redis://localhost:6379/1
+      CELERY_RESULT_BACKEND: redis://localhost:6379/2
+      JWT_SECRET: release-test-jwt-secret-not-for-production
+      AES_KEY: aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd
+      ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r backend/requirements.txt pytest pytest-asyncio httpx anyio
+      - name: Run all integration tests
+        run: |
+          pytest backend/tests/integration/ backend/tests/contract/ \
+            -v --tb=short -x --timeout=60
+
+  # ============================================================
+  # BUILD: Docker images tagged with release version
+  # ============================================================
+  docker-build:
+    name: Build Release Images
+    needs: integration-tests
+    runs-on: ubuntu-latest
+    outputs:
+      backend-image: ${{ env.ECR_REGISTRY }}/mindbridge-backend:${{ env.RELEASE_TAG }}
+      chat-image: ${{ env.ECR_REGISTRY }}/mindbridge-chat:${{ env.RELEASE_TAG }}
+      frontend-image: ${{ env.ECR_REGISTRY }}/mindbridge-frontend:${{ env.RELEASE_TAG }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push backend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/mindbridge-backend:${{ env.RELEASE_TAG }}
+            ${{ env.ECR_REGISTRY }}/mindbridge-backend:production-latest
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            GIT_COMMIT=${{ github.sha }}
+            VERSION=${{ env.RELEASE_TAG }}
+
+      - name: Build and push chat service
+        uses: docker/build-push-action@v5
+        with:
+          context: ./chat_service
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/mindbridge-chat:${{ env.RELEASE_TAG }}
+            ${{ env.ECR_REGISTRY }}/mindbridge-chat:production-latest
+
+      - name: Build and push frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/mindbridge-frontend:${{ env.RELEASE_TAG }}
+            ${{ env.ECR_REGISTRY }}/mindbridge-frontend:production-latest
+          build-args: |
+            VITE_API_URL=${{ secrets.PRODUCTION_API_URL }}
+            VITE_CHAT_URL=${{ secrets.PRODUCTION_CHAT_URL }}
+
+      - name: Trivy scan all production images
+        run: |
+          for IMAGE in backend chat frontend; do
+            echo "Scanning mindbridge-$IMAGE:${{ env.RELEASE_TAG }}"
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              aquasec/trivy:latest image \
+              --exit-code 1 \
+              --severity CRITICAL \
+              "${{ env.ECR_REGISTRY }}/mindbridge-$IMAGE:${{ env.RELEASE_TAG }}"
+          done
+
+  # ============================================================
+  # DEPLOY: Production Rolling Update
+  # ============================================================
+  deploy-production:
+    name: Deploy to Production
+    needs: docker-build
+    runs-on: ubuntu-latest
+    environment: production
+    outputs:
+      deployment-id: ${{ steps.deploy-backend.outputs.deployment-id }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Save previous task definition ARNs (for rollback)
+        run: |
+          echo "Saving previous task definition ARNs for potential rollback..."
+          for SERVICE in backend chat-service celery-worker celery-beat frontend; do
+            PREV_ARN=$(aws ecs describe-services \
+              --cluster "${{ env.ECS_CLUSTER }}" \
+              --services "mindbridge-$SERVICE" \
+              --query 'services[0].taskDefinition' \
+              --output text)
+            echo "PREV_${SERVICE//-/_}_ARN=$PREV_ARN" >> $GITHUB_ENV
+            echo "Previous task def for $SERVICE: $PREV_ARN"
+          done
+
+      - name: Fetch and update backend task definition
+        id: backend-td
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: infra/ecs/backend-task-def.json
+          container-name: backend
+          image: ${{ env.ECR_REGISTRY }}/mindbridge-backend:${{ env.RELEASE_TAG }}
+
+      - name: Deploy backend (rolling update)
+        id: deploy-backend
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.backend-td.outputs.task-definition }}
+          service: mindbridge-backend
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+          deployment-controller: ECS
+          force-new-deployment: true
+
+      - name: Fetch and update chat service task definition
+        id: chat-td
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: infra/ecs/chat-task-def.json
+          container-name: chat_service
+          image: ${{ env.ECR_REGISTRY }}/mindbridge-chat:${{ env.RELEASE_TAG }}
+
+      - name: Deploy chat service (rolling update)
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.chat-td.outputs.task-definition }}
+          service: mindbridge-chat-service
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+          force-new-deployment: true
+
+      - name: Fetch and update frontend task definition
+        id: frontend-td
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: infra/ecs/frontend-task-def.json
+          container-name: frontend
+          image: ${{ env.ECR_REGISTRY }}/mindbridge-frontend:${{ env.RELEASE_TAG }}
+
+      - name: Deploy frontend (rolling update)
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.frontend-td.outputs.task-definition }}
+          service: mindbridge-frontend
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+          force-new-deployment: true
+
+  # ============================================================
+  # VALIDATE: Post-deployment Health Checks + Smoke Tests
+  # ============================================================
+  post-deployment-validation:
+    name: Post-Deployment Validation
+    needs: deploy-production
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test tools
+        run: pip install httpx pytest pytest-asyncio requests
+
+      - name: Wait for production stabilization
+        run: sleep 30
+
+      - name: Health check all modules
+        id: health-check
+        env:
+          PROD_URL: ${{ secrets.PRODUCTION_URL }}
+        run: |
+          FAILED=0
+          MODULES=("auth" "matching" "chat" "appointments" "resources" "peer" "admin")
+
+          echo "Running health checks against: $PROD_URL"
+          echo "========================================"
+
+          for module in "${MODULES[@]}"; do
+            RESPONSE=$(curl -sf --max-time 10 "$PROD_URL/health/$module" 2>/dev/null || echo '{"status":"error"}')
+            STATUS=$(echo "$RESPONSE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('status','unknown'))" 2>/dev/null || echo "error")
+            
+            if [ "$STATUS" != "ok" ]; then
+              echo "❌ FAILED: $module (status=$STATUS)"
+              echo "   Response: $RESPONSE"
+              FAILED=$((FAILED+1))
+            else
+              echo "✅ PASSED: $module"
+            fi
+          done
+
+          echo "========================================"
+          echo "Health check summary: $FAILED module(s) failed"
+
+          if [ $FAILED -gt 0 ]; then
+            echo "health_check_failed=true" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          echo "health_check_failed=false" >> $GITHUB_OUTPUT
+
+      - name: Run production smoke tests
+        id: smoke-tests
+        if: steps.health-check.outcome == 'success'
+        env:
+          PROD_URL: ${{ secrets.PRODUCTION_URL }}
+          SMOKE_TEST_TOKEN: ${{ secrets.SMOKE_TEST_TOKEN }}
+        run: |
+          pytest backend/tests/smoke/ \
+            -v \
+            --tb=short \
+            -m "smoke and production" \
+            --base-url="$PROD_URL"
+
+      - name: Verify key SLA metrics
+        if: steps.health-check.outcome == 'success'
+        env:
+          PROD_URL: ${{ secrets.PRODUCTION_URL }}
+        run: |
+          # Check API response time for critical endpoints
+          for ENDPOINT in "/api/v1/resources" "/api/v1/appointments/availability"; do
+            START=$(date +%s%N)
+            curl -sf "$PROD_URL$ENDPOINT" -H "Accept: application/json" > /dev/null
+            END=$(date +%s%N)
+            DURATION=$(( (END - START) / 1000000 ))
+            echo "$ENDPOINT: ${DURATION}ms"
+            if [ $DURATION -gt 3000 ]; then
+              echo "⚠️  WARNING: $ENDPOINT responded in ${DURATION}ms (SLA: <3000ms)"
+            fi
+          done
+
+  # ============================================================
+  # AUTO-ROLLBACK on health check or smoke test failure
+  # ============================================================
+  auto-rollback:
+    name: Auto-Rollback
+    needs: post-deployment-validation
+    runs-on: ubuntu-latest
+    if: failure()
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🔴 ROLLBACK — Revert to previous task definitions
+        run: |
+          echo "🚨 INITIATING AUTO-ROLLBACK for release ${{ env.RELEASE_TAG }}"
+          echo "Reverting all services to their previous task definition versions..."
+
+          ROLLBACK_FAILED=0
+
+          for SERVICE in backend chat-service frontend; do
+            VARNAME="PREV_${SERVICE//-/_}_ARN"
+            PREV_ARN="${!VARNAME}"
+
+            if [ -z "$PREV_ARN" ]; then
+              echo "⚠️  No previous ARN found for $SERVICE — skipping"
+              continue
+            fi
+
+            echo "Rolling back $SERVICE to: $PREV_ARN"
+            aws ecs update-service \
+              --cluster "${{ env.ECS_CLUSTER }}" \
+              --service "mindbridge-$SERVICE" \
+              --task-definition "$PREV_ARN" \
+              --force-new-deployment \
+              --no-cli-pager || ROLLBACK_FAILED=$((ROLLBACK_FAILED+1))
+          done
+
+          if [ $ROLLBACK_FAILED -gt 0 ]; then
+            echo "❌ ROLLBACK FAILED for $ROLLBACK_FAILED service(s) — MANUAL INTERVENTION REQUIRED"
+            exit 1
+          fi
+
+          echo "Waiting for rollback to stabilize..."
+          sleep 60
+
+          # Verify rollback health
+          HEALTH=$(curl -sf "${{ secrets.PRODUCTION_URL }}/health" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || echo "error")
+          if [ "$HEALTH" == "ok" ]; then
+            echo "✅ Rollback successful — production is healthy on previous version"
+          else
+            echo "❌ Rollback health check failed — MANUAL INTERVENTION REQUIRED"
+            exit 1
+          fi
+
+      - name: Notify team of rollback
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          custom_payload: |
+            {
+              "text": "🚨 *Production Rollback Triggered*",
+              "attachments": [{
+                "color": "danger",
+                "fields": [
+                  {"title": "Release", "value": "${{ env.RELEASE_TAG }}", "short": true},
+                  {"title": "Reason", "value": "Health checks or smoke tests failed", "short": true},
+                  {"title": "Action", "value": "Rolled back to previous version", "short": false},
+                  {"title": "Triggered by", "value": "${{ github.actor }}", "short": true}
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ============================================================
+  # SUCCESS: Create GitHub Release
+  # ============================================================
+  create-release:
+    name: Create GitHub Release
+    needs: post-deployment-validation
+    runs-on: ubuntu-latest
+    if: success()
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          PREV_TAG=$(git tag --sort=-version:refname | sed -n '2p')
+          echo "Previous tag: $PREV_TAG"
+          if [ -n "$PREV_TAG" ]; then
+            CHANGES=$(git log --oneline "$PREV_TAG..${{ env.RELEASE_TAG }}" --no-merges)
+          else
+            CHANGES=$(git log --oneline --no-merges | head -20)
+          fi
+          echo "CHANGELOG<<EOF" >> $GITHUB_ENV
+          echo "$CHANGES" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "MindBridge ${{ env.RELEASE_TAG }}"
+          body: |
+            ## MindBridge ${{ env.RELEASE_TAG }}
+
+            ### Deployment
+            ✅ Deployed to production and all health checks passed.
+
+            ### Changes
+            ${{ env.CHANGELOG }}
+
+            ### Docker Images
+            - `mindbridge-backend:${{ env.RELEASE_TAG }}`
+            - `mindbridge-chat:${{ env.RELEASE_TAG }}`
+            - `mindbridge-frontend:${{ env.RELEASE_TAG }}`
+
+            ### PIA
+            Privacy Impact Assessment completed and closed before this release.
+          draft: false
+          prerelease: ${{ contains(env.RELEASE_TAG, '-rc') }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notify team of successful release
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          custom_payload: |
+            {
+              "text": "✅ *Production Release Successful*",
+              "attachments": [{
+                "color": "good",
+                "fields": [
+                  {"title": "Release", "value": "${{ env.RELEASE_TAG }}", "short": true},
+                  {"title": "Environment", "value": "Production", "short": true},
+                  {"title": "All health checks", "value": "Passed ✅", "short": true},
+                  {"title": "Deployed by", "value": "${{ github.actor }}", "short": true}
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

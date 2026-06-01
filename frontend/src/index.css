@@ -1,0 +1,191 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-navy-950 text-slate-100 font-sans;
+  }
+
+  * {
+    @apply box-border;
+  }
+
+  :focus-visible {
+    @apply outline-2 outline-offset-2 outline-indigo-500;
+  }
+
+  ::selection {
+    @apply bg-indigo-500/30 text-white;
+  }
+
+  ::-webkit-scrollbar {
+    @apply w-1.5;
+  }
+
+  ::-webkit-scrollbar-track {
+    @apply bg-navy-900;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply bg-navy-700 rounded-full;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-indigo-500/50;
+  }
+}
+
+@layer components {
+  .glass-card {
+    @apply bg-navy-800/40 backdrop-blur-md border border-white/10 rounded-2xl;
+  }
+
+  .glass-card-hover {
+    @apply glass-card transition-all duration-300 hover:bg-navy-800/60 hover:border-indigo-500/30 hover:shadow-lg hover:shadow-indigo-500/10;
+  }
+
+  .btn-primary {
+    @apply bg-indigo-500 hover:bg-indigo-600 text-white font-semibold px-6 py-3 rounded-xl transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 focus:ring-offset-navy-900 disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .btn-secondary {
+    @apply bg-navy-700/60 hover:bg-navy-700 text-slate-200 font-medium px-6 py-3 rounded-xl border border-white/10 hover:border-white/20 transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-slate-500 focus:ring-offset-2 focus:ring-offset-navy-900;
+  }
+
+  .btn-teal {
+    @apply bg-teal-500 hover:bg-teal-600 text-white font-semibold px-6 py-3 rounded-xl transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-teal-500 focus:ring-offset-2 focus:ring-offset-navy-900 disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .btn-danger {
+    @apply bg-red-500/20 hover:bg-red-500/40 text-red-400 hover:text-red-300 font-medium px-4 py-2 rounded-lg border border-red-500/20 hover:border-red-500/40 transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2 focus:ring-offset-navy-900;
+  }
+
+  .input-field {
+    @apply bg-navy-800/60 border border-white/10 rounded-xl px-4 py-3 text-slate-100 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition-all duration-200 w-full;
+  }
+
+  .label {
+    @apply block text-sm font-medium text-slate-300 mb-1.5;
+  }
+
+  .metric-tile {
+    @apply glass-card p-5 flex flex-col gap-2;
+  }
+
+  .nav-link {
+    @apply flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium text-slate-300 hover:text-white hover:bg-white/5 transition-all duration-200;
+  }
+
+  .nav-link-active {
+    @apply nav-link bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30;
+  }
+
+  .badge {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
+  }
+
+  .section-heading {
+    @apply text-2xl font-bold text-white;
+  }
+
+  .text-muted {
+    @apply text-slate-400;
+  }
+
+  .divider {
+    @apply border-t border-white/10;
+  }
+
+  .tag-chip {
+    @apply inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-navy-700/60 text-slate-300 border border-white/10 cursor-pointer hover:bg-indigo-500/20 hover:text-indigo-300 hover:border-indigo-500/30 transition-all duration-150;
+  }
+
+  .tag-chip-active {
+    @apply tag-chip bg-indigo-500/30 text-indigo-300 border-indigo-500/50;
+  }
+}
+
+/* Calendar custom styles */
+.react-calendar {
+  @apply bg-navy-800/40 border border-white/10 rounded-2xl p-4 w-full text-slate-100;
+  font-family: 'Inter', sans-serif !important;
+}
+
+.react-calendar__navigation button {
+  @apply text-slate-200 hover:bg-navy-700/50 rounded-lg transition-colors;
+  min-width: 40px;
+}
+
+.react-calendar__navigation button:disabled {
+  @apply opacity-30;
+}
+
+.react-calendar__month-view__weekdays {
+  @apply text-slate-400 text-xs font-medium;
+}
+
+.react-calendar__month-view__days__day {
+  @apply text-slate-200 hover:bg-indigo-500/20 hover:text-indigo-300 rounded-lg transition-colors;
+  padding: 8px !important;
+}
+
+.react-calendar__tile--active {
+  @apply bg-indigo-500 text-white rounded-lg !important;
+}
+
+.react-calendar__tile--now {
+  @apply bg-teal-500/20 text-teal-300 rounded-lg !important;
+}
+
+.react-calendar__tile--active.react-calendar__tile--now {
+  @apply bg-indigo-500 text-white !important;
+}
+
+.react-calendar__tile:disabled {
+  @apply opacity-30 cursor-not-allowed !important;
+}
+
+/* Chat message animations */
+.message-bubble-enter {
+  animation: messageAppear 0.3s ease-out;
+}
+
+@keyframes messageAppear {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* Typing indicator */
+.typing-dot {
+  animation: typingBounce 1.4s infinite ease-in-out;
+}
+
+.typing-dot:nth-child(1) { animation-delay: 0s; }
+.typing-dot:nth-child(2) { animation-delay: 0.2s; }
+.typing-dot:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes typingBounce {
+  0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+  30% { transform: translateY(-8px); opacity: 1; }
+}
+
+/* Confetti animation */
+.confetti-piece {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  animation: confettiFall 3s linear infinite;
+}
+
+@keyframes confettiFall {
+  0% { transform: translateY(-100%) rotate(0deg); opacity: 1; }
+  100% { transform: translateY(100vh) rotate(360deg); opacity: 0; }
+}
